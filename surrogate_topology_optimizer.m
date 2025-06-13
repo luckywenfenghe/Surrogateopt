@@ -4,8 +4,10 @@
 
 clear; close all; clc;
 
-% Declare global variables first
-global FAST_ITERATIONS COARSE_MESH_SIZE;
+% FIXED: Set random seed for reproducibility (new_suggest.txt #6)
+RANDOM_SEED = 42;
+rng(RANDOM_SEED, 'twister');
+fprintf('Random seed set to %d for reproducibility\n', RANDOM_SEED);
 
 fprintf('=== ROBUST SURROGATE HPO FOR TOPOLOGY OPTIMIZATION ===\n');
 
@@ -33,9 +35,11 @@ catch ME
 end
 
 %% OPTIMIZED CONFIGURATION (FAST HPO MODE)
-LEGACY_WARMUP_RUNS = 8;      % Reduced from 20 → 8 for speed
-SURROGATE_MAX_EVALS = 30;    % Reduced from 50 → 30 for speed  
-BATCH_SIZE = 3;              % Parallel batch size for surrogate
+% IMPROVED: Better sampling strategy (new_suggest.txt #3)
+LEGACY_WARMUP_RUNS = 5;      % Reduced legacy runs, use LHS for better coverage
+LHS_WARMUP_RUNS = 15;        % LHS sampling for better space coverage (≥10×dim)
+SURROGATE_MAX_EVALS = 40;    % Increased for better convergence
+BATCH_SIZE = 4;              % Match number of workers
 SAVE_RESULTS = true;         % Save all results
 TIMEOUT_MINUTES = 3;         % Reduced timeout for faster failure detection
 
@@ -45,16 +49,23 @@ FINE_MESH_SIZE = 80;         % Fine mesh for final validation
 FAST_ITERATIONS = 15;        % Fast iterations for HPO (was 40)
 FULL_ITERATIONS = 120;       % Full iterations for final validation
 
-% Set global values for wrapper functions
-FAST_ITERATIONS = 15;
-COARSE_MESH_SIZE = 40;
-fprintf('Performance settings: Mesh %dx%d → %dx%d, Iterations %d → %d\n', ...
-    COARSE_MESH_SIZE, COARSE_MESH_SIZE, FINE_MESH_SIZE, FINE_MESH_SIZE, ...
-    FAST_ITERATIONS, FULL_ITERATIONS);
-
 % Parameter bounds: [beta_init, qa_factor, mv_factor, rmin_factor]
 lb = [0.5, 0.7, 0.7, 0.7];
 ub = [3.0, 1.4, 1.4, 1.4];
+
+% FIXED: Create configuration structure AFTER lb/ub definition (basic_final_suggest.txt #5)
+hpo_config = struct();
+hpo_config.fast_iterations = FAST_ITERATIONS;
+hpo_config.coarse_mesh_size = COARSE_MESH_SIZE;
+hpo_config.fine_mesh_size = FINE_MESH_SIZE;
+hpo_config.full_iterations = FULL_ITERATIONS;
+hpo_config.lb = lb;
+hpo_config.ub = ub;
+
+fprintf('Performance settings: Mesh %dx%d → %dx%d, Iterations %d → %d\n', ...
+    hpo_config.coarse_mesh_size, hpo_config.coarse_mesh_size, ...
+    hpo_config.fine_mesh_size, hpo_config.fine_mesh_size, ...
+    hpo_config.fast_iterations, hpo_config.full_iterations);
 param_names = {'beta_init', 'qa_growth_factor', 'mv_adaptation_rate', 'rmin_decay_rate'};
 
 fprintf('Parameter space: [%.1f-%.1f, %.1f-%.1f, %.1f-%.1f, %.1f-%.1f]\n', ...
@@ -62,30 +73,53 @@ fprintf('Parameter space: [%.1f-%.1f, %.1f-%.1f, %.1f-%.1f, %.1f-%.1f]\n', ...
 fprintf('Legacy warm-start: %d evaluations\n', LEGACY_WARMUP_RUNS);
 fprintf('Surrogate exploration: %d evaluations\n', SURROGATE_MAX_EVALS);
 
-%% PHASE 1: LEGACY WARM-START DATA GENERATION
-fprintf('\n--- Phase 1: Legacy Warm-Start Generation ---\n');
+%% PHASE 1: IMPROVED WARM-START DATA GENERATION
+fprintf('\n--- Phase 1: Improved Warm-Start Generation ---\n');
+
+% IMPROVED: Combined Legacy + LHS sampling (new_suggest.txt #3)
+TOTAL_WARMUP_RUNS = LEGACY_WARMUP_RUNS + LHS_WARMUP_RUNS;
 
 % Initialize storage
-X_warmstart = zeros(LEGACY_WARMUP_RUNS, 4);
-F_warmstart = zeros(LEGACY_WARMUP_RUNS, 1);
-metrics_history = cell(LEGACY_WARMUP_RUNS, 1);
+X_warmstart = zeros(TOTAL_WARMUP_RUNS, 4);
+F_warmstart = zeros(TOTAL_WARMUP_RUNS, 1);
+metrics_history = cell(TOTAL_WARMUP_RUNS, 1);
 
-% Starting parameters (reasonable defaults)
+% Generate LHS samples for better space coverage
+fprintf('Generating %d LHS samples for better parameter space coverage...\n', LHS_WARMUP_RUNS);
+% IMPROVED: Use maximin criterion for better space filling (basic_final_suggest.txt #3)
+X_lhs = lhsdesign(LHS_WARMUP_RUNS, 4, 'criterion', 'maximin');
+% Scale to parameter bounds
+for i = 1:4
+    X_lhs(:, i) = lb(i) + X_lhs(:, i) * (ub(i) - lb(i));
+end
+
+% Starting parameters for legacy runs (reasonable defaults)
 current_params = [2.0, 1.0, 1.0, 1.0];
 
 % Timing
 warmstart_time = tic;
 
-% Generate legacy warm-start data
-for i = 1:LEGACY_WARMUP_RUNS
-    fprintf('Legacy %d/%d: [%.2f, %.2f, %.2f, %.2f]', ...
-        i, LEGACY_WARMUP_RUNS, current_params(1), current_params(2), ...
-        current_params(3), current_params(4));
+% Generate combined warm-start data: Legacy + LHS
+for i = 1:TOTAL_WARMUP_RUNS
+    if i <= LEGACY_WARMUP_RUNS
+        % Legacy sampling with adaptive updates
+        fprintf('Legacy %d/%d: [%.2f, %.2f, %.2f, %.2f]', ...
+            i, LEGACY_WARMUP_RUNS, current_params(1), current_params(2), ...
+            current_params(3), current_params(4));
+        eval_params = current_params;
+    else
+        % LHS sampling for better space coverage
+        lhs_idx = i - LEGACY_WARMUP_RUNS;
+        eval_params = X_lhs(lhs_idx, :);
+        fprintf('LHS %d/%d: [%.2f, %.2f, %.2f, %.2f]', ...
+            lhs_idx, LHS_WARMUP_RUNS, eval_params(1), eval_params(2), ...
+            eval_params(3), eval_params(4));
+    end
     
     % Evaluate with current parameters (with timeout protection)
     eval_start = tic;
     try
-        [obj, metrics] = topology_wrapper_with_metrics(current_params);
+        [obj, metrics] = topology_wrapper_with_metrics(eval_params, hpo_config);
         eval_time = toc(eval_start);
         
         % Check for reasonable evaluation time
@@ -102,7 +136,7 @@ for i = 1:LEGACY_WARMUP_RUNS
     end
     
     % Store results
-    X_warmstart(i, :) = current_params;
+    X_warmstart(i, :) = eval_params;
     F_warmstart(i) = obj;
     metrics_history{i} = metrics;
     
@@ -114,7 +148,7 @@ for i = 1:LEGACY_WARMUP_RUNS
     fprintf(' → Obj: %.3e, Gray: %.1f%%, Conv: %s\n', ...
         obj, metrics.gray, conv_str);
     
-    % Update using legacy logic
+    % Update using legacy logic (only for legacy samples)
     if i < LEGACY_WARMUP_RUNS
         current_params = legacy_parameter_update(current_params, metrics, i);
         % Enforce bounds
@@ -147,34 +181,42 @@ if license('test', 'GADS_Toolbox')
                 'VariableNames', {'x1','x2','x3','x4'});
             initial_table.objective = F_warmstart;
             
+            % IMPROVED: Enable parallel evaluation (new_suggest.txt #4)
             options = optimoptions('surrogateopt', ...
                 'InitialPoints', initial_table, ...
                 'MaxFunctionEvaluations', SURROGATE_MAX_EVALS, ...
                 'Display', 'iter', ...
-                'UseParallel', false, ...  % Keep false to avoid nested parallel issues
-                'MinSampleDistance', 0.08);
+                'UseParallel', true, ...   % Enable parallel evaluation
+                'BatchSize', BATCH_SIZE, ... % Match number of workers
+                'MinSampleDistance', 0.1/sqrt(length(lb)));  % FIXED: Scale with dimension
             fprintf('Using InitialPoints table for warm-start\n');
             
         catch
             % Fallback to basic options without initial points
             options = optimoptions('surrogateopt', ...
-                'MaxFunctionEvaluations', SURROGATE_MAX_EVALS + LEGACY_WARMUP_RUNS, ...
+                'MaxFunctionEvaluations', SURROGATE_MAX_EVALS + TOTAL_WARMUP_RUNS, ...
                 'Display', 'iter', ...
-                'UseParallel', false, ...
-                'MinSampleDistance', 0.08);
+                'UseParallel', true, ...   % Enable parallel evaluation
+                'BatchSize', BATCH_SIZE, ... % Match number of workers
+                'MinSampleDistance', 0.1/sqrt(length(lb)));  % FIXED: Scale with dimension
             fprintf('Using basic surrogateopt (will pre-evaluate warm points)\n');
             
             % Pre-evaluate warm-start points
-            fprintf('Pre-evaluating %d warm-start points...\n', LEGACY_WARMUP_RUNS);
-            for i = 1:LEGACY_WARMUP_RUNS
-                f_check = topology_wrapper(X_warmstart(i,:));
+            fprintf('Pre-evaluating %d warm-start points...\n', TOTAL_WARMUP_RUNS);
+            for i = 1:TOTAL_WARMUP_RUNS
+                [f_check, ~, ~] = wrapper_with_constraints(X_warmstart(i,:), hpo_config);
                 fprintf('  Warm %d: f=%.3e\n', i, f_check);
             end
         end
         
-        % Run surrogate optimization
+        % IMPROVED: Single evaluation for objective and constraints (避免重复计算)
         surrogate_time = tic;
-        [x_optimal, f_optimal, exitflag, output] = surrogateopt(@topology_wrapper, lb, ub, options);
+        
+        % Add constraint tolerance to options
+        options.ConstraintTolerance = 1e-3;
+        
+        fprintf('Using single-evaluation wrapper for optimal efficiency...\n');
+        [x_optimal, f_optimal, exitflag, output] = surrogateopt(@(x) wrapper_with_constraints(x, hpo_config), lb, ub, options);
         surrogate_time = toc(surrogate_time);
         
         fprintf('Surrogate optimization completed\n');
@@ -205,13 +247,13 @@ params_hifi.beta_init = x_optimal(1);
 params_hifi.qa_growth_factor = x_optimal(2);
 params_hifi.mv_adaptation_rate = x_optimal(3);
 params_hifi.rmin_decay_rate = x_optimal(4);
-params_hifi.max_iterations = FULL_ITERATIONS;  % Full iterations
-params_hifi.nely = FINE_MESH_SIZE;            % Fine mesh for accuracy
+params_hifi.max_iterations = hpo_config.full_iterations;  % Full iterations
+params_hifi.nely = hpo_config.fine_mesh_size;            % Fine mesh for accuracy
 params_hifi.force_serial = true;              % Keep serial for stability
 params_hifi.disable_plotting = false;         % Enable plotting for final result
 
 fprintf('Running high-fidelity validation (%dx%d mesh, %d iterations)...\n', ...
-    FINE_MESH_SIZE, FINE_MESH_SIZE, FULL_ITERATIONS);
+    hpo_config.fine_mesh_size, hpo_config.fine_mesh_size, hpo_config.full_iterations);
 final_result = topFlow_mpi_robust(params_hifi);
 
 %% RESULTS ANALYSIS AND SUMMARY
@@ -261,7 +303,7 @@ end
 fprintf('  Final validation: %.2f min\n', final_result.time/60);
 fprintf('  Total time: %.2f min\n', total_time/60);
 
-%% SAVE RESULTS
+%% SAVE RESULTS WITH ENHANCED LOGGING
 if SAVE_RESULTS
     results = struct();
     results.X_warmstart = X_warmstart;
@@ -278,10 +320,47 @@ if SAVE_RESULTS
     results.param_names = param_names;
     results.bounds = [lb; ub];
     
+    % IMPROVED: Enhanced logging for reproducibility (basic_final_suggest.txt #7)
+    results.experiment_info = struct();
+    results.experiment_info.random_seed = RANDOM_SEED;
+    results.experiment_info.matlab_version = version;
+    results.experiment_info.matlab_detailed = ver('MATLAB');  % Include patch version
+    results.experiment_info.timestamp = datestr(now, 'yyyy-mm-dd HH:MM:SS');
+    results.experiment_info.config = hpo_config;
+    results.experiment_info.legacy_runs = LEGACY_WARMUP_RUNS;
+    results.experiment_info.lhs_runs = LHS_WARMUP_RUNS;
+    results.experiment_info.surrogate_evals = SURROGATE_MAX_EVALS;
+    results.experiment_info.script_name = mfilename('fullpath');  % Record script path
+    
     timestamp = datestr(now, 'yyyymmdd_HHMMSS');
     filename = sprintf('surrogate_results_%s.mat', timestamp);
     save(filename, 'results');
-    fprintf('\nResults saved to %s\n', filename);
+    
+    % Also save JSON log for easy inspection
+    json_filename = sprintf('run_log_%s.json', timestamp);
+    log_data = struct();
+    log_data.seed = RANDOM_SEED;
+    log_data.timestamp = results.experiment_info.timestamp;
+    log_data.bounds = [lb; ub];
+    log_data.optimal_params = x_optimal;
+    log_data.optimal_objective = f_optimal;
+    log_data.total_time_minutes = total_time/60;
+    
+    % Write JSON log (simple format)
+    fid = fopen(json_filename, 'w');
+    if fid ~= -1
+        fprintf(fid, '{\n');
+        fprintf(fid, '  "seed": %d,\n', log_data.seed);
+        fprintf(fid, '  "timestamp": "%s",\n', log_data.timestamp);
+        fprintf(fid, '  "optimal_params": [%.4f, %.4f, %.4f, %.4f],\n', x_optimal);
+        fprintf(fid, '  "optimal_objective": %.6e,\n', f_optimal);
+        fprintf(fid, '  "total_time_minutes": %.2f\n', log_data.total_time_minutes);
+        fprintf(fid, '}\n');
+        fclose(fid);
+        fprintf('JSON log saved to %s\n', json_filename);
+    end
+    
+    fprintf('Results saved to %s\n', filename);
 end
 
 fprintf('\n=== SURROGATE HPO COMPLETED ===\n');
@@ -298,18 +377,14 @@ catch
     % Ignore pool status errors
 end
 
-%% TOPOLOGY OPTIMIZATION WRAPPER (§4.2 from suggest.txt)
-function f = topology_wrapper(x)
-    % Robust wrapper following code review recommendations
+%% COMBINED OBJECTIVE AND CONSTRAINTS WRAPPER (OPTIMAL EFFICIENCY)
+function [f, c, ceq] = wrapper_with_constraints(x, config)
+    % IMPROVED: Single evaluation for both objective and constraints
+    % Avoids duplicate topFlow_mpi_robust calls, ~2x speedup
     
-    % Get global performance settings
-    global FAST_ITERATIONS COARSE_MESH_SIZE;
-    if isempty(FAST_ITERATIONS); FAST_ITERATIONS = 15; end
-    if isempty(COARSE_MESH_SIZE); COARSE_MESH_SIZE = 40; end
-    
-    % Parameter validation
-    x = max(x, [0.5, 0.7, 0.7, 0.7]);  % Lower bounds
-    x = min(x, [3.0, 1.4, 1.4, 1.4]);  % Upper bounds
+    % Parameter validation using config bounds
+    x = max(x, config.lb);  % Lower bounds
+    x = min(x, config.ub);  % Upper bounds
     
     % Build parameter structure (FAST HPO MODE)
     params = struct();
@@ -318,46 +393,48 @@ function f = topology_wrapper(x)
     params.qa_growth_factor = x(2);
     params.mv_adaptation_rate = x(3);
     params.rmin_decay_rate = x(4);
-    params.max_iterations = FAST_ITERATIONS;  % Fast evaluation for HPO
-    params.nely = COARSE_MESH_SIZE;          % Coarse mesh for speed
+    params.max_iterations = config.fast_iterations;  % Fast evaluation for HPO
+    params.nely = config.coarse_mesh_size;          % Coarse mesh for speed
     params.force_serial = true;              % Avoid pool conflicts
     params.disable_plotting = true;         % No plotting during HPO
     
     try
-        % Call robust topology optimizer
+        % Single call to topology optimizer
         result = topFlow_mpi_robust(params);
         
-        % FIXED: Rebalanced objective weights (suggest_for_adjust.txt §2)
-        % Normalize physical objective to [0,1] range
-        obj_normalized = result.obj / 1000.0;  % Assuming ~1000 is typical range
+        % Objective function (pure physical objective)
+        f = result.obj;
         
-        f = obj_normalized ...                      % Normalized physical objective
-          + 0.5 * (result.gray/100)^2 ...          % Reduced grayscale penalty
-          + (~result.converged) * 0.1;             % Reduced convergence penalty
+        % Inequality constraints (c <= 0)
+        c = [
+            result.gray - 20;           % Grayscale <= 20%
+            double(~result.converged)   % Must converge (0 if converged, 1 if not)
+        ];
         
-        % Ensure finite result
+        % Equality constraints (ceq = 0) - none for now
+        ceq = [];
+        
+        % Ensure finite results
         if ~isfinite(f)
             f = 1e6;
+            c = [100; 1];  % Large constraint violations
         end
         
     catch ME
         fprintf('  ERROR in topology evaluation: %s\n', ME.message);
         f = 1e6;  % Large penalty for failed evaluations
+        c = [100; 1];  % Large constraint violations
+        ceq = [];
     end
 end
 
-%% TOPOLOGY WRAPPER WITH DETAILED METRICS (FOR WARM-START PHASE)
-function [obj, metrics] = topology_wrapper_with_metrics(x)
-    % Extended wrapper that returns both objective and detailed metrics
+%% TOPOLOGY WRAPPER WITH DETAILED METRICS (IMPROVED - no global variables)
+function [obj, metrics] = topology_wrapper_with_metrics(x, config)
+    % IMPROVED: Thread-safe wrapper without global variables (new_suggest.txt #5)
     
-    % Get global performance settings
-    global FAST_ITERATIONS COARSE_MESH_SIZE;
-    if isempty(FAST_ITERATIONS); FAST_ITERATIONS = 15; end
-    if isempty(COARSE_MESH_SIZE); COARSE_MESH_SIZE = 40; end
-    
-    % Parameter validation
-    x = max(x, [0.5, 0.7, 0.7, 0.7]);  % Lower bounds
-    x = min(x, [3.0, 1.4, 1.4, 1.4]);  % Upper bounds
+    % Parameter validation using config bounds
+    x = max(x, config.lb);  % Lower bounds
+    x = min(x, config.ub);  % Upper bounds
     
     % Build parameter structure (FAST HPO MODE)
     params = struct();
@@ -366,8 +443,8 @@ function [obj, metrics] = topology_wrapper_with_metrics(x)
     params.qa_growth_factor = x(2);
     params.mv_adaptation_rate = x(3);
     params.rmin_decay_rate = x(4);
-    params.max_iterations = FAST_ITERATIONS;  % Fast evaluation for HPO
-    params.nely = COARSE_MESH_SIZE;          % Coarse mesh for speed
+    params.max_iterations = config.fast_iterations;  % Fast evaluation for HPO
+    params.nely = config.coarse_mesh_size;          % Coarse mesh for speed
     params.force_serial = true;              % Avoid pool conflicts
     params.disable_plotting = true;         % No plotting during HPO
     
@@ -375,13 +452,8 @@ function [obj, metrics] = topology_wrapper_with_metrics(x)
         % Call robust topology optimizer
         result = topFlow_mpi_robust(params);
         
-        % FIXED: Rebalanced objective weights (suggest_for_adjust.txt §2)
-        % Normalize physical objective to [0,1] range
-        obj_normalized = result.obj / 1000.0;  % Assuming ~1000 is typical range
-        
-        obj = obj_normalized ...                    % Normalized physical objective
-            + 0.5 * (result.gray/100)^2 ...        % Reduced grayscale penalty
-            + (~result.converged) * 0.1;           % Reduced convergence penalty
+        % IMPROVED: Adaptive weight normalization (new_suggest.txt #2)
+        obj = adaptive_objective_function(result, config);
         
         % Extract detailed metrics for legacy update logic
         metrics = struct();
@@ -453,5 +525,98 @@ function params_next = legacy_parameter_update(params, metrics, iteration)
         params_next = params_next + noise;
     end
 end
+
+%% ADAPTIVE OBJECTIVE FUNCTION (IMPROVED NORMALIZATION)
+function f = adaptive_objective_function(result, config)
+    % IMPROVED: Adaptive weight normalization (new_suggest.txt #2)
+    % Implements normalized ParEGO-style objective with automatic scaling
+    
+    persistent obj_history gray_history conv_history;
+    
+    % Initialize history on first call
+    if isempty(obj_history)
+        obj_history = [];
+        gray_history = [];
+        conv_history = [];
+    end
+    
+    % Add current result to history
+    obj_history(end+1) = result.obj;
+    gray_history(end+1) = result.gray;
+    conv_history(end+1) = ~result.converged;
+    
+    % Keep only recent history (sliding window)
+    max_history = 20;
+    if length(obj_history) > max_history
+        obj_history = obj_history(end-max_history+1:end);
+        gray_history = gray_history(end-max_history+1:end);
+        conv_history = conv_history(end-max_history+1:end);
+    end
+    
+    % IMPROVED: More robust adaptive normalization (basic_final_suggest.txt #9)
+    if length(obj_history) >= 10  % Require more samples for stable statistics
+        % Use robust statistics with outlier clipping
+        obj_sorted = sort(obj_history);
+        gray_sorted = sort(gray_history);
+        
+        % Use interquartile range for robust normalization
+        q25_obj = prctile(obj_sorted, 25);
+        q75_obj = prctile(obj_sorted, 75);
+        q25_gray = prctile(gray_sorted, 25);
+        q75_gray = prctile(gray_sorted, 75);
+        
+        % Robust center and scale
+        mu_obj = median(obj_sorted);
+        sigma_obj = max(q75_obj - q25_obj, 1e-6);
+        mu_gray = median(gray_sorted);
+        sigma_gray = max(q75_gray - q25_gray, 1e-6);
+        
+        % Normalized components with clipping
+        f_obj = max(-3, min(3, (result.obj - mu_obj) / sigma_obj));  % Clip outliers
+        f_gray = max(0, min(3, (result.gray - mu_gray) / sigma_gray));
+        if result.converged
+            f_conv = 0;
+        else
+            f_conv = 1;
+        end
+        
+        % Adaptive weighted combination
+        f = f_obj + 0.5 * f_gray^2 + 0.2 * f_conv;
+    elseif length(obj_history) >= 3
+        % Medium-term: use simple statistics but with more conservative weights
+        mu_obj = mean(obj_history);
+        sigma_obj = std(obj_history) + 1e-6;
+        mu_gray = mean(gray_history);
+        sigma_gray = std(gray_history) + 1e-6;
+        
+        f_obj = (result.obj - mu_obj) / sigma_obj;
+        f_gray = max(0, (result.gray - mu_gray) / sigma_gray);
+        if result.converged
+            f_conv = 0;
+        else
+            f_conv = 0.5;  % Reduced penalty during learning phase
+        end
+        
+        f = f_obj + 0.3 * f_gray^2 + 0.1 * f_conv;  % Conservative weights
+    else
+        % Early phase: use static normalization
+        f_obj = result.obj / 1000.0;
+        f_gray = (result.gray / 100)^2;
+        if ~result.converged
+            f_conv = 0.1;
+        else
+            f_conv = 0;
+        end
+        
+        f = f_obj + 0.5 * f_gray + f_conv;
+    end
+    
+    % Ensure finite result
+    if ~isfinite(f)
+        f = 1e6;
+    end
+end
+
+
 
 fprintf('Surrogate topology optimizer ready. Run this script to execute.\n'); 
