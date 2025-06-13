@@ -1,6 +1,7 @@
 %% COMPLETE SURROGATE HPO FOR TOPOLOGY OPTIMIZATION
-% Implementation following suggest.txt code review recommendations
-% Addresses all identified bugs and performance issues
+% Implementation following o3super_pro_suggest.txt code review recommendations
+% Addresses all identified bugs and performance issues and intergrate the
+% fancy math formular to automate calibration
 
 clear; close all; clc;
 
@@ -52,6 +53,10 @@ FULL_ITERATIONS = 120;       % Full iterations for final validation
 % Parameter bounds: [beta_init, qa_factor, mv_factor, rmin_factor]
 lb = [0.5, 0.7, 0.7, 0.7];
 ub = [3.0, 1.4, 1.4, 1.4];
+
+% ACADEMIC OBJECTIVE PARAMETERS (Eq. 9-12 from warm_suggest.txt)
+VOL_TARGET = 0.25;  % Target volume fraction (= volfrac)
+ZETA = [];          % Scaling factor (will be auto-calibrated in Phase 1)
 
 % FIXED: Create configuration structure AFTER lb/ub definition (basic_final_suggest.txt #5)
 hpo_config = struct();
@@ -140,6 +145,14 @@ for i = 1:TOTAL_WARMUP_RUNS
     F_warmstart(i) = obj;
     metrics_history{i} = metrics;
     
+    % ZETA AUTO-CALIBRATION (first evaluation only)
+    if isempty(ZETA) && isfield(metrics, 'obj_p1') && isfield(metrics, 'Mnd')
+        base = metrics.obj_p1;  % Primary objective with p=1
+        aux = (VOL_TARGET - metrics.vol)^2 + metrics.Mnd;  % Volume + discreteness terms
+        ZETA = base / max(aux, 1e-12);  % Ensure same order of magnitude
+        fprintf(' → ZETA auto-calibrated: %.3e\n', ZETA);
+    end
+    
     if metrics.converged
         conv_str = 'Y';
     else
@@ -174,31 +187,21 @@ fprintf('\n--- Phase 2: Surrogate Optimization ---\n');
 % Check if Global Optimization Toolbox is available
 if license('test', 'GADS_Toolbox')
     try
-        % Configure surrogate optimization (following suggest.txt §4.1)
+        % Configure surrogate optimization with version compatibility
         try
             % FIXED: Proper table construction (suggest_for_adjust.txt §2)
             initial_table = array2table(X_warmstart, ...
                 'VariableNames', {'x1','x2','x3','x4'});
             initial_table.objective = F_warmstart;
             
-            % IMPROVED: Enable parallel evaluation (new_suggest.txt #4)
-            options = optimoptions('surrogateopt', ...
-                'InitialPoints', initial_table, ...
-                'MaxFunctionEvaluations', SURROGATE_MAX_EVALS, ...
-                'Display', 'iter', ...
-                'UseParallel', true, ...   % Enable parallel evaluation
-                'BatchSize', BATCH_SIZE, ... % Match number of workers
-                'MinSampleDistance', 0.1/sqrt(length(lb)));  % FIXED: Scale with dimension
+            % IMPROVED: Version-compatible options setup
+            options = create_surrogate_options(SURROGATE_MAX_EVALS, BATCH_SIZE, lb, true, initial_table);
             fprintf('Using InitialPoints table for warm-start\n');
             
-        catch
+        catch ME_table
+            fprintf('Warning: InitialPoints table setup failed: %s\n', ME_table.message);
             % Fallback to basic options without initial points
-            options = optimoptions('surrogateopt', ...
-                'MaxFunctionEvaluations', SURROGATE_MAX_EVALS + TOTAL_WARMUP_RUNS, ...
-                'Display', 'iter', ...
-                'UseParallel', true, ...   % Enable parallel evaluation
-                'BatchSize', BATCH_SIZE, ... % Match number of workers
-                'MinSampleDistance', 0.1/sqrt(length(lb)));  % FIXED: Scale with dimension
+            options = create_surrogate_options(SURROGATE_MAX_EVALS + TOTAL_WARMUP_RUNS, BATCH_SIZE, lb, false, []);
             fprintf('Using basic surrogateopt (will pre-evaluate warm points)\n');
             
             % Pre-evaluate warm-start points
@@ -209,11 +212,8 @@ if license('test', 'GADS_Toolbox')
             end
         end
         
-        % IMPROVED: Single evaluation for objective and constraints (避免重复计算)
+        % IMPROVED: Single evaluation for objective and constraints 
         surrogate_time = tic;
-        
-        % Add constraint tolerance to options
-        options.ConstraintTolerance = 1e-3;
         
         fprintf('Using single-evaluation wrapper for optimal efficiency...\n');
         [x_optimal, f_optimal, exitflag, output] = surrogateopt(@(x) wrapper_with_constraints(x, hpo_config), lb, ub, options);
@@ -382,6 +382,9 @@ function [f, c, ceq] = wrapper_with_constraints(x, config)
     % IMPROVED: Single evaluation for both objective and constraints
     % Avoids duplicate topFlow_mpi_robust calls, ~2x speedup
     
+    % Access global parameters for academic objective
+    global VOL_TARGET ZETA
+    
     % Parameter validation using config bounds
     x = max(x, config.lb);  % Lower bounds
     x = min(x, config.ub);  % Upper bounds
@@ -402,16 +405,23 @@ function [f, c, ceq] = wrapper_with_constraints(x, config)
         % Single call to topology optimizer
         result = topFlow_mpi_robust(params);
         
-        % Objective function (pure physical objective)
-        f = result.obj;
+        % ACADEMIC OBJECTIVE FUNCTION (Eq. 9 from warm_suggest.txt)
+        if ~isempty(ZETA) && isfield(result, 'obj_p1') && isfield(result, 'Mnd')
+            % Use academic formulation: f = c̃(x,y) + ζ[(f-V)² + M_nd]
+            vol_penalty = (VOL_TARGET - result.vol)^2;
+            discrete_penalty = result.Mnd;
+            f = result.obj_p1 + ZETA * (vol_penalty + discrete_penalty);
+        else
+            % Fallback to standard objective if metrics unavailable
+            f = result.obj;
+        end
         
-        % Inequality constraints (c <= 0)
+        % SIMPLIFIED CONSTRAINTS: Only convergence required
         c = [
-            result.gray - 20;           % Grayscale <= 20%
             double(~result.converged)   % Must converge (0 if converged, 1 if not)
         ];
         
-        % Equality constraints (ceq = 0) - none for now
+        % Equality constraints (ceq = 0) - none
         ceq = [];
         
         % Ensure finite results
@@ -458,6 +468,8 @@ function [obj, metrics] = topology_wrapper_with_metrics(x, config)
         % Extract detailed metrics for legacy update logic
         metrics = struct();
         metrics.obj_raw = result.obj;
+        metrics.obj_p1 = result.obj_p1;  % NEW: p=1 objective
+        metrics.Mnd = result.Mnd;        % NEW: Non-discreteness measure
         metrics.gray = result.gray;
         metrics.vol = result.vol;
         metrics.converged = result.converged;
@@ -482,7 +494,7 @@ function [obj, metrics] = topology_wrapper_with_metrics(x, config)
     catch ME
         fprintf('  ERROR in topology evaluation: %s\n', ME.message);
         obj = 1e6;
-        metrics = struct('obj_raw', 1e6, 'gray', 100, 'vol', 0, ...
+        metrics = struct('obj_raw', 1e6, 'obj_p1', 1e6, 'Mnd', 1.0, 'gray', 100, 'vol', 0, ...
                         'converged', false, 'iterations', 0, 'time', 0, 'change', 0);
     end
 end
@@ -496,15 +508,18 @@ function params_next = legacy_parameter_update(params, metrics, iteration)
     if iteration > 8 && metrics.change < 0.01
         params_next(1) = min(params(1) * 1.08, 3.0);
     end
-    if metrics.gray > 25
-        params_next(1) = min(params(1) * 1.05, 3.0);
+    % MODIFIED: Encourage complex flow structures - reduce beta when grayscale is too low
+    if metrics.gray < 50
+        params_next(1) = max(params(1) * 0.95, 0.5);  % Reduce beta to encourage gray zones
+    elseif metrics.gray > 70
+        params_next(1) = min(params(1) * 1.02, 3.0);  % Slight increase when grayscale is good
     end
     
-    % QA factor based on progress
-    if metrics.gray > 20
-        params_next(2) = min(params(2) * 1.15, 1.4);
-    elseif metrics.gray < 10 && metrics.converged
-        params_next(2) = max(params(2) * 0.95, 0.7);
+    % QA factor based on progress - encourage higher grayscale
+    if metrics.gray < 60
+        params_next(2) = max(params(2) * 0.95, 0.7);  % Reduce qa to encourage flow channels
+    elseif metrics.gray > 70 && metrics.converged
+        params_next(2) = min(params(2) * 1.05, 1.4);  % Increase qa when grayscale is sufficient
     end
     
     % Move limit factor based on convergence rate
@@ -526,93 +541,90 @@ function params_next = legacy_parameter_update(params, metrics, iteration)
     end
 end
 
-%% ADAPTIVE OBJECTIVE FUNCTION (IMPROVED NORMALIZATION)
+%% VERSION-COMPATIBLE SURROGATE OPTIONS CREATOR
+function options = create_surrogate_options(max_evals, batch_size, lb, use_init_points, init_table)
+    % Create surrogate optimization options with version compatibility
+    % Handles different MATLAB versions that may not support all options
+    
+    % Base options (available in all versions)
+    base_options = {
+        'MaxFunctionEvaluations', max_evals, ...
+        'Display', 'iter', ...
+        'UseParallel', true, ...   % Enable parallel evaluation
+        'MinSampleDistance', 0.1/sqrt(length(lb)) ...  % Scale with dimension
+    };
+    
+    % Add constraint tolerance (generally available)
+    extended_options = [base_options, {'ConstraintTolerance', 1e-3}];
+    
+    % Try to add InitialPoints if requested
+    if use_init_points && ~isempty(init_table)
+        try
+            extended_options = [extended_options, {'InitialPoints', init_table}];
+            fprintf('✓ InitialPoints supported\n');
+        catch
+            fprintf('! InitialPoints not supported in this MATLAB version\n');
+        end
+    end
+    
+    % Try to add BatchSize (newer versions only)
+    try
+        test_options = [extended_options, {'BatchSize', batch_size}];
+        options = optimoptions('surrogateopt', test_options{:});
+        fprintf('✓ BatchSize=%d supported\n', batch_size);
+    catch ME_batch
+        if contains(ME_batch.message, 'BatchSize')
+            fprintf('! BatchSize not supported in this MATLAB version, using sequential evaluation\n');
+            options = optimoptions('surrogateopt', extended_options{:});
+        else
+            % If other error, try with minimal options
+            fprintf('Warning: Some advanced options not supported: %s\n', ME_batch.message);
+            minimal_options = {
+                'MaxFunctionEvaluations', max_evals, ...
+                'Display', 'iter', ...
+                'UseParallel', true
+            };
+            options = optimoptions('surrogateopt', minimal_options{:});
+        end
+    end
+end
+
+%% ACADEMIC OBJECTIVE FUNCTION (Eq. 9 from warm_suggest.txt)
 function f = adaptive_objective_function(result, config)
-    % IMPROVED: Adaptive weight normalization (new_suggest.txt #2)
-    % Implements normalized ParEGO-style objective with automatic scaling
+    % ACADEMIC FORMULATION: f = c̃(x,y) + ζ[(f-V)² + M_nd]
+    % This replaces all previous grayscale-based penalties with mathematically principled approach
     
-    persistent obj_history gray_history conv_history;
+    % Access global parameters
+    global VOL_TARGET ZETA
     
-    % Initialize history on first call
-    if isempty(obj_history)
-        obj_history = [];
-        gray_history = [];
-        conv_history = [];
-    end
-    
-    % Add current result to history
-    obj_history(end+1) = result.obj;
-    gray_history(end+1) = result.gray;
-    conv_history(end+1) = ~result.converged;
-    
-    % Keep only recent history (sliding window)
-    max_history = 20;
-    if length(obj_history) > max_history
-        obj_history = obj_history(end-max_history+1:end);
-        gray_history = gray_history(end-max_history+1:end);
-        conv_history = conv_history(end-max_history+1:end);
-    end
-    
-    % IMPROVED: More robust adaptive normalization (basic_final_suggest.txt #9)
-    if length(obj_history) >= 10  % Require more samples for stable statistics
-        % Use robust statistics with outlier clipping
-        obj_sorted = sort(obj_history);
-        gray_sorted = sort(gray_history);
+    % Use academic objective if all components are available
+    if ~isempty(ZETA) && isfield(result, 'obj_p1') && isfield(result, 'Mnd')
+        % Primary objective with p=1 SIMP
+        primary_obj = result.obj_p1;
         
-        % Use interquartile range for robust normalization
-        q25_obj = prctile(obj_sorted, 25);
-        q75_obj = prctile(obj_sorted, 75);
-        q25_gray = prctile(gray_sorted, 25);
-        q75_gray = prctile(gray_sorted, 75);
+        % Volume fraction penalty term
+        vol_penalty = (VOL_TARGET - result.vol)^2;
         
-        % Robust center and scale
-        mu_obj = median(obj_sorted);
-        sigma_obj = max(q75_obj - q25_obj, 1e-6);
-        mu_gray = median(gray_sorted);
-        sigma_gray = max(q75_gray - q25_gray, 1e-6);
+        % Non-discreteness penalty term
+        discrete_penalty = result.Mnd;
         
-        % Normalized components with clipping
-        f_obj = max(-3, min(3, (result.obj - mu_obj) / sigma_obj));  % Clip outliers
-        f_gray = max(0, min(3, (result.gray - mu_gray) / sigma_gray));
-        if result.converged
-            f_conv = 0;
-        else
-            f_conv = 1;
-        end
+        % Combined academic objective (Eq. 9)
+        f = primary_obj + ZETA * (vol_penalty + discrete_penalty);
         
-        % Adaptive weighted combination
-        f = f_obj + 0.5 * f_gray^2 + 0.2 * f_conv;
-    elseif length(obj_history) >= 3
-        % Medium-term: use simple statistics but with more conservative weights
-        mu_obj = mean(obj_history);
-        sigma_obj = std(obj_history) + 1e-6;
-        mu_gray = mean(gray_history);
-        sigma_gray = std(gray_history) + 1e-6;
-        
-        f_obj = (result.obj - mu_obj) / sigma_obj;
-        f_gray = max(0, (result.gray - mu_gray) / sigma_gray);
-        if result.converged
-            f_conv = 0;
-        else
-            f_conv = 0.5;  % Reduced penalty during learning phase
-        end
-        
-        f = f_obj + 0.3 * f_gray^2 + 0.1 * f_conv;  % Conservative weights
-    else
-        % Early phase: use static normalization
-        f_obj = result.obj / 1000.0;
-        f_gray = (result.gray / 100)^2;
+        % Add small convergence penalty if needed
         if ~result.converged
-            f_conv = 0.1;
-        else
-            f_conv = 0;
+            f = f + 0.1 * primary_obj;  % 10% penalty for non-convergence
         end
-        
-        f = f_obj + 0.5 * f_gray + f_conv;
+    else
+        % Fallback to simplified objective if academic metrics unavailable
+        f = result.obj;
+        if ~result.converged
+            f = f * 2.0;  % Double penalty for non-convergence
+        end
     end
     
     % Ensure finite result
-    if ~isfinite(f)
+    if ~isfinite(f) || f <= 0
         f = 1e6;
     end
 end
