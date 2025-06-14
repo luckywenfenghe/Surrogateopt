@@ -39,7 +39,7 @@ end
 % IMPROVED: Better sampling strategy (new_suggest.txt #3)
 LEGACY_WARMUP_RUNS = 5;      % Reduced legacy runs, use LHS for better coverage
 LHS_WARMUP_RUNS = 15;        % LHS sampling for better space coverage (≥10×dim)
-SURROGATE_MAX_EVALS = 40;    % Increased for better convergence
+SURROGATE_MAX_EVALS = 60;    % Increased for better convergence (was 40)
 BATCH_SIZE = 4;              % Match number of workers
 SAVE_RESULTS = true;         % Save all results
 TIMEOUT_MINUTES = 3;         % Reduced timeout for faster failure detection
@@ -76,7 +76,7 @@ param_names = {'beta_init', 'qa_growth_factor', 'mv_adaptation_rate', 'rmin_deca
 fprintf('Parameter space: [%.1f-%.1f, %.1f-%.1f, %.1f-%.1f, %.1f-%.1f]\n', ...
     lb(1), ub(1), lb(2), ub(2), lb(3), ub(3), lb(4), ub(4));
 fprintf('Legacy warm-start: %d evaluations\n', LEGACY_WARMUP_RUNS);
-fprintf('Surrogate exploration: %d evaluations\n', SURROGATE_MAX_EVALS);
+fprintf('Surrogate exploration: %d evaluations (increased from 40)\n', SURROGATE_MAX_EVALS);
 
 %% PHASE 1: IMPROVED WARM-START DATA GENERATION
 fprintf('\n--- Phase 1: Improved Warm-Start Generation ---\n');
@@ -242,18 +242,19 @@ fprintf('\n--- Phase 3: High-Fidelity Validation ---\n');
 
 % Run final validation with FINE MESH and FULL ITERATIONS
 params_hifi = struct();
-params_hifi.enable_surrogate_mode = true;
+params_hifi.enable_surrogate_mode = false;    % CRITICAL: Disable surrogate mode for full validation
 params_hifi.beta_init = x_optimal(1);
 params_hifi.qa_growth_factor = x_optimal(2);
 params_hifi.mv_adaptation_rate = x_optimal(3);
 params_hifi.rmin_decay_rate = x_optimal(4);
-params_hifi.max_iterations = hpo_config.full_iterations;  % Full iterations
-params_hifi.nely = hpo_config.fine_mesh_size;            % Fine mesh for accuracy
-params_hifi.force_serial = true;              % Keep serial for stability
+params_hifi.max_iterations = hpo_config.full_iterations;  % Full iterations (120)
+params_hifi.nely = hpo_config.fine_mesh_size;            % Fine mesh for accuracy (80x80)
+params_hifi.force_serial = false;             % Allow parallel for high-precision validation
 params_hifi.disable_plotting = false;         % Enable plotting for final result
 
 fprintf('Running high-fidelity validation (%dx%d mesh, %d iterations)...\n', ...
     hpo_config.fine_mesh_size, hpo_config.fine_mesh_size, hpo_config.full_iterations);
+fprintf('*** HIGH-FIDELITY MODE ENABLED *** (Full %d iterations)\n', hpo_config.full_iterations);
 final_result = topFlow_mpi_robust(params_hifi);
 
 %% RESULTS ANALYSIS AND SUMMARY
