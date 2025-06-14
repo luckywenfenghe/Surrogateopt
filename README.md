@@ -14,13 +14,13 @@
 ## 🔧 系统要求
 
 ### MATLAB 环境
-- **MATLAB 版本**: R2019b 或更高版本 (已测试R2019b-R2024b兼容性)
+- **MATLAB 版本**: R2024b 或更高版本 (已测试R2019b-R2024b兼容性)
 - **必需工具箱**:
   - **Global Optimization Toolbox** (必需，用于surrogateopt算法)
   - **Parallel Computing Toolbox** (推荐，用于并行计算加速)
 - **版本兼容性**: 
-  - ✅ **完全支持**: R2020b+ (包含BatchSize和完整InitialPoints支持)
-  - ✅ **良好支持**: R2019b-R2020a (自动适配受限选项)
+  - ✅ **完全支持**: R2025b+ (包含BatchSize和完整InitialPoints支持)
+  - ✅ **良好支持**: R2019b-R2024a (自动适配受限选项)
   - ⚠️ **基础支持**: 更早版本 (可能需要手动调整)
 
 ### 硬件配置
