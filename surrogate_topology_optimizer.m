@@ -559,11 +559,29 @@ function options = create_surrogate_options(max_evals, batch_size, lb, use_init_
     
     % Try to add InitialPoints if requested
     if use_init_points && ~isempty(init_table)
+        % First try: Table format (newer MATLAB versions)
         try
-            extended_options = [extended_options, {'InitialPoints', init_table}];
-            fprintf('✓ InitialPoints supported\n');
-        catch
-            fprintf('! InitialPoints not supported in this MATLAB version\n');
+            test_options_table = [extended_options, {'InitialPoints', init_table}];
+            options_test = optimoptions('surrogateopt', test_options_table{:});
+            extended_options = test_options_table;
+            fprintf('✓ InitialPoints (table format) supported\n');
+        catch ME_table
+            % Second try: Matrix format (older MATLAB versions)
+            try
+                if istable(init_table)
+                    init_matrix = table2array(init_table(:, 1:end-1));  % Exclude objective column
+                else
+                    init_matrix = init_table;
+                end
+                test_options_matrix = [extended_options, {'InitialPoints', init_matrix}];
+                options_test = optimoptions('surrogateopt', test_options_matrix{:});
+                extended_options = test_options_matrix;
+                fprintf('✓ InitialPoints (matrix format) supported\n');
+            catch ME_matrix
+                fprintf('! InitialPoints not supported - Table error: %s\n', ME_table.message);
+                fprintf('! InitialPoints not supported - Matrix error: %s\n', ME_matrix.message);
+                % Continue without InitialPoints
+            end
         end
     end
     
@@ -573,18 +591,31 @@ function options = create_surrogate_options(max_evals, batch_size, lb, use_init_
         options = optimoptions('surrogateopt', test_options{:});
         fprintf('✓ BatchSize=%d supported\n', batch_size);
     catch ME_batch
-        if contains(ME_batch.message, 'BatchSize')
-            fprintf('! BatchSize not supported in this MATLAB version, using sequential evaluation\n');
+        try
+            % Try without BatchSize but with other extended options
             options = optimoptions('surrogateopt', extended_options{:});
-        else
-            % If other error, try with minimal options
-            fprintf('Warning: Some advanced options not supported: %s\n', ME_batch.message);
+            if contains(ME_batch.message, 'BatchSize')
+                fprintf('! BatchSize not supported, using sequential evaluation\n');
+            else
+                fprintf('! Advanced options partially supported\n');
+            end
+        catch ME_extended
+            % If extended options fail, use minimal options
+            fprintf('Warning: Using minimal options due to compatibility: %s\n', ME_extended.message);
             minimal_options = {
                 'MaxFunctionEvaluations', max_evals, ...
                 'Display', 'iter', ...
                 'UseParallel', true
             };
-            options = optimoptions('surrogateopt', minimal_options{:});
+            try
+                options = optimoptions('surrogateopt', minimal_options{:});
+            catch ME_minimal
+                % Last resort: ultra-minimal options
+                fprintf('Warning: Using ultra-minimal options: %s\n', ME_minimal.message);
+                options = optimoptions('surrogateopt', ...
+                    'MaxFunctionEvaluations', max_evals, ...
+                    'Display', 'iter');
+            end
         end
     end
 end

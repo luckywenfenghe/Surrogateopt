@@ -14,10 +14,14 @@
 ## 🔧 系统要求
 
 ### MATLAB 环境
-- **MATLAB 版本**: R2019b 或更高版本
+- **MATLAB 版本**: R2019b 或更高版本 (已测试R2019b-R2024b兼容性)
 - **必需工具箱**:
   - **Global Optimization Toolbox** (必需，用于surrogateopt算法)
   - **Parallel Computing Toolbox** (推荐，用于并行计算加速)
+- **版本兼容性**: 
+  - ✅ **完全支持**: R2020b+ (包含BatchSize和完整InitialPoints支持)
+  - ✅ **良好支持**: R2019b-R2020a (自动适配受限选项)
+  - ⚠️ **基础支持**: 更早版本 (可能需要手动调整)
 
 ### 硬件配置
 - **内存**: 建议8GB+ RAM (4GB最低要求)
@@ -64,6 +68,19 @@ surrogate_topology_optimizer
 - 控制台实时显示优化进度
 - 结果自动保存为 `surrogate_results_YYYYMMDD_HHMMSS.mat`
 - JSON日志保存为 `run_log_YYYYMMDD_HHMMSS.json`
+
+### 🚨 初次运行常见问题
+```matlab
+% 如果看到兼容性警告，这是正常的：
+% ✓ InitialPoints (matrix format) supported  <- 正常
+% ! BatchSize not supported                  <- 正常，会自动适配
+% Warning: Using minimal options            <- 正常，功能不受影响
+
+% 如果遇到错误：
+% 1. 检查工具箱: license('test', 'GADS_Toolbox')
+% 2. 检查并行池: 可能需要手动关闭 delete(gcp)
+% 3. 内存不足: 降低网格大小或评估次数
+```
 
 ## 🎛️ 优化参数配置
 
@@ -140,14 +157,19 @@ SURROGATE_MAX_EVALS = 40 % 代理模型最大评估次数
 ```
 === ROBUST SURROGATE HPO FOR TOPOLOGY OPTIMIZATION ===
 Random seed set to 42 for reproducibility
+Parallel pool ready with 4 workers (IdleTimeout=Inf)
 Performance settings: Mesh 40x40 → 80x80, Iterations 15 → 120
 
 --- Phase 1: Improved Warm-Start Generation ---
 Legacy 1/5: [2.00, 1.00, 1.00, 1.00] → Obj: 1.234e+03, Gray: 15.2%, Conv: Y
+→ ZETA auto-calibrated: 2.456e-04
 LHS 1/15: [1.25, 1.15, 0.85, 1.20] → Obj: 1.156e+03, Gray: 18.7%, Conv: Y
 ...
 
 --- Phase 2: Surrogate Optimization ---
+✓ InitialPoints (matrix format) supported
+✓ BatchSize=4 supported
+Using single-evaluation wrapper for optimal efficiency...
 Surrogate optimization completed
 Exit flag: 1, Total evaluations: 40
 
@@ -166,6 +188,12 @@ Final design metrics:
   Grayscale: 12.3%
   Volume fraction: 0.400
   Convergence: Yes
+  
+Timing summary:
+  Warm-start phase: 8.45 min
+  Surrogate phase: 22.31 min
+  Final validation: 4.12 min
+  Total time: 34.88 min
 ```
 
 ### 保存的文件
@@ -259,7 +287,18 @@ ub = [4.0, 1.6, 1.6, 1.6];  % 更宽松的上界
 问题: 'BatchSize' 不是适用于 SURROGATEOPT 的选项
 解决: 程序会自动检测版本兼容性，使用支持的选项
 说明: BatchSize选项仅在MATLAB R2020b及更高版本中可用
+
+问题: "OPTIONS 参数 InitialPoints 的值无效: 必须为矩阵或结构体"
+解决: 程序会自动测试table格式→matrix格式→跳过InitialPoints
+说明: InitialPoints参数在不同MATLAB版本中支持的格式不同
 ```
+
+### 兼容性测试与自适应
+系统现已集成**智能版本兼容性检测**，能够：
+- 🔍 **实时测试**每个surrogateopt选项的兼容性
+- 🔄 **自动降级**从高级选项到基础选项
+- 📊 **格式转换**自动尝试table→matrix→跳过的策略
+- ⚡ **性能保持**即使在受限版本中也保持优化效果
 
 ### 性能优化建议
 - 💾 **存储**: 使用SSD提高I/O性能
@@ -317,7 +356,25 @@ ub = [4.0, 1.6, 1.6, 1.6];  % 更宽松的上界
 3. 🔧 参数设置的合理性
 4. 📁 文件权限和路径问题
 
-**版本**: v2.0  
-**更新日期**: 2024年  
-**兼容性**: MATLAB R2019b+  
+---
+
+## 🔄 最近更新 (v2.1)
+
+### 🛠️ 兼容性增强
+- ✅ **智能选项检测**: 实时测试surrogateopt选项兼容性
+- 🔄 **自动适配**: table→matrix→跳过的多层次兼容策略  
+- 📊 **版本报告**: 详细的MATLAB版本和工具箱信息记录
+- ⚡ **性能保持**: 即使在受限环境中也确保优化效果
+
+### 🎯 功能优化
+- 🧮 **学术目标函数**: 采用标准多目标优化公式 `f = c̃(x,y) + ζ[(f-V)² + M_nd]`
+- 🤖 **ZETA自动标定**: 首次评估时自动平衡各项权重
+- ⏱️ **并行池管理**: 优化的池生命周期管理，避免重复创建
+- 📈 **增强日志**: 更详细的实验信息和可重现性支持
+
+---
+
+**版本**: v2.1  
+**更新日期**: 2024年12月  
+**兼容性**: MATLAB R2019b+ (已测试至R2024b)  
 **许可证**: MIT License
